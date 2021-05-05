@@ -430,6 +430,7 @@ func genMixins(pkg *pschema.PackageSpec, metadata *resources.AzureAPIMetadata) e
 const (
 	extensionClientFlatten      = "x-ms-client-flatten"
 	extensionClientName         = "x-ms-client-name"
+	extensionDiscriminatorValue = "x-ms-discriminator-value"
 	extensionEnum               = "x-ms-enum"
 	extensionLongRunning        = "x-ms-long-running-operation"
 	extensionLongRunningDefault = "azure-async-operation"
@@ -450,10 +451,127 @@ type packageGenerator struct {
 }
 
 func (g *packageGenerator) genResources(prov, typeName string, resource *openapi.ResourceSpec) error {
+	// A single API path can be modelled as several resources if it accepts a polymorphic payload:
+	// i.e., when the request body is a discriminated union type of several object types. Pulumi
+	// schema doesn't support polymorphic (OneOf) resources, so the provider creates a separate resource
+	// per each union case. We call them "variants" in the code below.
+	variants, err := g.findResourceVariants(resource)
+	if err != nil {
+		return errors.Wrapf(err, "resource %s.%s", prov, typeName)
+	}
+	var variantNames []string
+	for _, d := range variants {
+		err = g.genResourceVariant(prov, d)
+		if err != nil {
+			return err
+		}
+		variantNames = append(variantNames, d.typeName)
+	}
+	mainResource := &resourceVariant{
+		ResourceSpec: resource,
+		typeName:     typeName,
+	}
+	if len(variants) > 0 {
+		// If variants are found, we still want to generate the "base" resource but only for compatibility
+		// reason. We should remove those resources in 2.0, as most of them simply don't work.
+		mainResource.deprecationMessage =
+			fmt.Sprintf("%s is deprecated. Please use one of the variants: %s.",
+				typeName, strings.Join(variantNames, ", "))
+	}
+	return g.genResourceVariant(prov, mainResource)
+}
+
+// resourceVariant points to request body's and response's schemas of a resource which is one of the variants
+// of a resource related to an API path.
+type resourceVariant struct {
+	*openapi.ResourceSpec
+	typeName           string
+	body               *openapi.Schema
+	response           *openapi.Schema
+	deprecationMessage string
+}
+
+// findResourceVariants searches for discriminated unions in the resource's API specs and returns
+// a list of those variants. An empty list is returned for non-discriminated types.
+func (g *packageGenerator) findResourceVariants(resource *openapi.ResourceSpec) ([]*resourceVariant, error) {
+	updateOp := resource.PathItem.Put
+	if resource.PathItem.Put == nil {
+		updateOp = resource.PathItem.Patch
+	}
+
+	// Check if the body schema has a discriminator, return otherwise.
+	bodySchema, err := getRequestBodySchema(resource.Swagger.ReferenceContext, updateOp.Parameters)
+	if bodySchema == nil || err != nil {
+		return nil, err
+	}
+
+	if bodySchema.Discriminator == "" {
+		return nil, nil
+	}
+
+	// Find the base schema of the response. Variants would all derive from this base schema.
+	responseSchema, err := getResponseSchema(resource.Swagger.ReferenceContext, updateOp.Responses.StatusCodeResponses)
+	if responseSchema == nil || err != nil {
+		return nil, err
+	}
+
+	// Built the map of response schemas per discriminator value or the default reponse schema if no discriminator.
+	responses := map[string]*openapi.Schema{}
+	var defaultResponse *openapi.Schema
+	if responseSchema.Discriminator != "" {
+		responseSubtypes, err := responseSchema.FindSubtypes()
+		if err != nil {
+			return nil, err
+		}
+		for _, subtype := range responseSubtypes {
+			resolvedSubSchema, err := responseSchema.ResolveSchema(subtype)
+			if err != nil {
+				return nil, err
+			}
+
+			discriminatorValue := strings.ToLower(getDiscriminatorValue(resolvedSubSchema))
+			responses[discriminatorValue] = resolvedSubSchema
+		}
+	} else {
+		defaultResponse = responseSchema
+	}
+
+	bodySubtypes, err := bodySchema.FindSubtypes()
+	if err != nil {
+		return nil, err
+	}
+
+	// For each body schema subtype, find the corresponding response schema subtype and return the pair
+	// as a resource variant.
+	var result []*resourceVariant
+	for _, subtype := range bodySubtypes {
+		resolvedSubSchema, err := bodySchema.ResolveSchema(subtype)
+		if err != nil {
+			return nil, err
+		}
+
+		discriminatorValue := strings.ToLower(getDiscriminatorValue(resolvedSubSchema))
+
+		response := defaultResponse
+		if v, ok := responses[discriminatorValue]; ok {
+			response = v
+		}
+
+		result = append(result, &resourceVariant{
+			ResourceSpec: resource,
+			typeName:     resources.DiscriminatedResourceName(resolvedSubSchema.ReferenceName),
+			body:         resolvedSubSchema,
+			response:     response,
+		})
+	}
+	return result, nil
+}
+
+func (g *packageGenerator) genResourceVariant(prov string, resource *resourceVariant) error {
 	module := g.providerToModule(prov)
 	swagger := resource.Swagger
 	path := resource.PathItem
-	resourceTok := fmt.Sprintf(`%s:%s:%s`, g.pkg.Name, module, typeName)
+	resourceTok := fmt.Sprintf(`%s:%s:%s`, g.pkg.Name, module, resource.typeName)
 
 	// Generate the resource.
 	gen := moduleGenerator{
@@ -461,7 +579,7 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 		metadata:      g.metadata,
 		module:        module,
 		prov:          prov,
-		resourceName:  typeName,
+		resourceName:  resource.typeName,
 		resourceToken: resourceTok,
 		visitedTypes:  make(map[string]bool),
 	}
@@ -475,12 +593,13 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 
 	parameters := resource.Swagger.MergeParameters(updateOp.Parameters, path.Parameters)
 	autoNamer := resources.NewAutoNamer(resource.Path)
-	resourceRequest, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, &autoNamer)
+
+	resourceRequest, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, &autoNamer, resource.body)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate '%s': request type", resourceTok)
 	}
 
-	resourceResponse, err := gen.genResponse(updateOp.Responses.StatusCodeResponses, swagger.ReferenceContext)
+	resourceResponse, err := gen.genResponse(updateOp.Responses.StatusCodeResponses, swagger.ReferenceContext, resource.response)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate '%s': response type", resourceTok)
 	}
@@ -490,7 +609,7 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 		return nil
 	}
 
-	gen.escapeCSharpNames(typeName, resourceResponse)
+	gen.escapeCSharpNames(resource.typeName, resourceResponse)
 
 	// Id is a property of the base Custom Resource, we don't want to introduce it on derived resources.
 	delete(resourceResponse.specs, "id")
@@ -498,12 +617,12 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 
 	// Add an alias for each API version that has the same path in it.
 	// Also, add an alias to the same version in azure-nextgen and all other versions in azure-nextgen.
-	alias := fmt.Sprintf("%s:%s:%s", "azure-nextgen", module, typeName)
+	alias := fmt.Sprintf("%s:%s:%s", "azure-nextgen", module, resource.typeName)
 	aliases := []pschema.AliasSpec{{Type: &alias}}
 	for _, version := range resource.CompatibleVersions {
 		moduleName := providerApiToModule(prov, version)
-		alias := fmt.Sprintf("%s:%s:%s", g.pkg.Name, moduleName, typeName)
-		nextGenAlias := fmt.Sprintf("%s:%s:%s", "azure-nextgen", moduleName, typeName)
+		alias := fmt.Sprintf("%s:%s:%s", g.pkg.Name, moduleName, resource.typeName)
+		nextGenAlias := fmt.Sprintf("%s:%s:%s", "azure-nextgen", moduleName, resource.typeName)
 		aliases = append(aliases, pschema.AliasSpec{Type: &alias}, pschema.AliasSpec{Type: &nextGenAlias})
 	}
 
@@ -517,11 +636,12 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 		InputProperties:    resourceRequest.specs,
 		RequiredInputs:     resourceRequest.requiredSpecs.SortedValues(),
 		Aliases:            aliases,
+		DeprecationMessage: resource.deprecationMessage,
 	}
 	g.pkg.Resources[resourceTok] = resourceSpec
 
 	// Generate the function to get this resource.
-	functionTok := fmt.Sprintf(`%s:%s:get%s`, g.pkg.Name, module, typeName)
+	functionTok := fmt.Sprintf(`%s:%s:get%s`, g.pkg.Name, module, resource.typeName)
 
 	var readOp *spec.Operation
 	switch {
@@ -538,11 +658,11 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 	}
 
 	parameters = swagger.MergeParameters(readOp.Parameters, path.Parameters)
-	requestFunction, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, nil)
+	requestFunction, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, nil, resource.body)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate '%s': request type", functionTok)
 	}
-	responseFunction, err := gen.genResponse(readOp.Responses.StatusCodeResponses, swagger.ReferenceContext)
+	responseFunction, err := gen.genResponse(readOp.Responses.StatusCodeResponses, swagger.ReferenceContext, resource.response)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate '%s': response type", functionTok)
 	}
@@ -550,6 +670,7 @@ func (g *packageGenerator) genResources(prov, typeName string, resource *openapi
 	if path.Get != nil && responseFunction != nil {
 		functionSpec := pschema.FunctionSpec{
 			Description:        g.formatDescription(resourceResponse, swagger.Info),
+			DeprecationMessage: resource.deprecationMessage,
 			Inputs: &pschema.ObjectTypeSpec{
 				Description: requestFunction.description,
 				Type:        "object",
@@ -680,12 +801,12 @@ func (g *packageGenerator) genPostFunctions(prov, typeName, path string, pathIte
 	functionTok := fmt.Sprintf(`%s:%s:%s`, g.pkg.Name, module, typeName)
 
 	parameters := swagger.MergeParameters(pathItem.Post.Parameters, pathItem.Parameters)
-	request, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, nil)
+	request, err := gen.genMethodParameters(parameters, swagger.ReferenceContext, nil, nil)
 	if err != nil {
 		log.Printf("failed to generate '%s': request type: %s", functionTok, err.Error())
 		return
 	}
-	response, err := gen.genResponse(pathItem.Post.Responses.StatusCodeResponses, swagger.ReferenceContext)
+	response, err := gen.genResponse(pathItem.Post.Responses.StatusCodeResponses, swagger.ReferenceContext, nil)
 	if err != nil {
 		log.Printf("failed to generate '%s': response type: %s", functionTok, err.Error())
 		return
@@ -697,7 +818,7 @@ func (g *packageGenerator) genPostFunctions(prov, typeName, path string, pathIte
 	}
 
 	functionSpec := pschema.FunctionSpec{
-		Description:        g.formatDescription(response, swagger.Info),
+		Description: g.formatDescription(response, swagger.Info),
 		Inputs: &pschema.ObjectTypeSpec{
 			Description: request.description,
 			Type:        "object",
@@ -759,6 +880,60 @@ func (g *packageGenerator) getAsyncStyle(op *spec.Operation) string {
 	return extensionLongRunningDefault
 }
 
+func getRequestBodySchema(ctx *openapi.ReferenceContext, parameters []spec.Parameter) (*openapi.Schema, error) {
+	for _, p := range parameters {
+		param, err := ctx.ResolveParameter(p)
+		if err != nil {
+			return nil, err
+		}
+		if param.In != "body" {
+			continue
+		}
+
+		resolvedSchema, err := param.ResolveSchema(param.Schema)
+		if err != nil {
+			return nil, err
+		}
+
+		return resolvedSchema, nil
+	}
+
+	return nil, nil
+}
+
+func getResponseSchema(ctx *openapi.ReferenceContext, statusCodeResponses map[int]spec.Response) (*openapi.Schema, error) {
+	var codes []int
+	for code := range statusCodeResponses {
+		if code >= 300 {
+			continue
+		}
+
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+
+	if len(codes) == 0 {
+		return nil, errors.New("no 2xx response found")
+	}
+
+	// Find the lowest 2xx response with a schema definition and derive response properties from it.
+	for _, code := range codes {
+		resp := statusCodeResponses[code]
+		response, err := ctx.ResolveResponse(resp)
+		if err != nil {
+			return nil, err
+		}
+
+		if response.Schema == nil {
+			continue
+		}
+
+		return response.ResolveSchema(response.Schema)
+
+	}
+	return nil, nil
+}
+
 type moduleGenerator struct {
 	pkg           *pschema.PackageSpec
 	metadata      *resources.AzureAPIMetadata
@@ -784,7 +959,7 @@ func (m *moduleGenerator) escapeCSharpNames(typeName string, resourceResponse *p
 }
 
 func (m *moduleGenerator) genMethodParameters(parameters []spec.Parameter, ctx *openapi.ReferenceContext,
-	namer *resources.AutoNamer) (*parameterBag, error) {
+	namer *resources.AutoNamer, bodySchema *openapi.Schema) (*parameterBag, error) {
 	result := newParameterBag()
 	var autoNamedSpec string
 
@@ -818,17 +993,19 @@ func (m *moduleGenerator) genMethodParameters(parameters []spec.Parameter, ctx *
 		case param.Name == "api-version":
 			continue // No need to include API version in the schema or meta, it is added automatically by the provider.
 		case param.In == "body":
-			// The body parameter is flattened, so that all its properties become the properties of the type.
 			if param.Schema == nil {
 				return nil, errors.Errorf("no schema for body parameter '%s'", param.Name)
 			}
 
-			resolvedSchema, err := param.ResolveSchema(param.Schema)
-			if err != nil {
-				return nil, errors.Wrapf(err, "body parameter '%s'", param.Name)
+			if bodySchema == nil {
+				bodySchema, err = param.ResolveSchema(param.Schema)
+				if err != nil {
+					return nil, errors.Wrapf(err, "body parameter '%s'", param.Name)
+				}
 			}
 
-			props, err := m.genProperties(resolvedSchema, false /* isOutput */, false /* isType */)
+			// The body parameter is flattened, so that all its properties become the properties of the type.
+			props, err := m.genProperties(bodySchema, false /* isOutput */, false /* isType */)
 			if err != nil {
 				return nil, err
 			}
@@ -841,7 +1018,6 @@ func (m *moduleGenerator) genMethodParameters(parameters []spec.Parameter, ctx *
 				Properties:         props.properties,
 				RequiredProperties: props.requiredProperties.SortedValues(),
 			}
-
 		default:
 			name := param.Name
 			if clientName, ok := param.Extensions.GetString(extensionClientName); ok {
@@ -894,69 +1070,35 @@ func isMethodParameter(param *openapi.Parameter) bool {
 	return false
 }
 
-func (m *moduleGenerator) genResponse(statusCodeResponses map[int]spec.Response, ctx *openapi.ReferenceContext) (*propertyBag, error) {
-	var responseSchema *openapi.Schema
+func (m *moduleGenerator) genResponse(statusCodeResponses map[int]spec.Response, ctx *openapi.ReferenceContext,
+	responseSchema *openapi.Schema) (*propertyBag, error) {
 
-	// Find all 2xx codes and sort them to make codegen deterministic.
-	var codes []int
-	for code := range statusCodeResponses {
-		if code >= 300 {
-			continue
-		}
-
-		codes = append(codes, code)
-	}
-	sort.Ints(codes)
-
-	if len(codes) == 0 {
-		return nil, errors.New("no 2xx response found")
-	}
-
-	// Find the lowest 2xx response with a schema definition and derive response properties from it.
-	for _, code := range codes {
-		resp := statusCodeResponses[code]
-		response, err := ctx.ResolveResponse(resp)
-		if err != nil {
+	if responseSchema == nil {
+		v, err := getResponseSchema(ctx, statusCodeResponses)
+		if v == nil || err != nil {
 			return nil, err
 		}
-
-		if response.Schema == nil {
-			continue
-		}
-
-		responseSchema, err = response.ResolveSchema(response.Schema)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(responseSchema.Type) > 0 && responseSchema.Type[0] == "array" {
-			// Array responses are not implemented yet (see issue #120).
-			return nil, nil
-		}
-
-		result, err := m.genProperties(responseSchema, true /* isOutput */, false /* isType */)
-		if err != nil {
-			return nil, err
-		}
-
-		// Skip empty result objects.
-		if len(result.specs) == 0 {
-			continue
-		}
-
-		// Special case the 'properties' output property as required.
-		// This should be gone when we apply flattening.
-		if _, ok := result.specs["properties"]; ok {
-			result.requiredSpecs.Add("properties")
-		}
-
-		result.description = responseSchema.Description
-		return result, nil
+		responseSchema = v
 	}
 
-	// There was at least one 2xx response defined, but it has no schema. This is not a valid resource for us,
-	// skip its processing.
-	return &propertyBag{}, nil
+	if len(responseSchema.Type) > 0 && responseSchema.Type[0] == "array" {
+		// Array responses are not implemented yet (see issue #120).
+		return nil, nil
+	}
+
+	result, err := m.genProperties(responseSchema, true /* isOutput */, false /* isType */)
+	if err != nil {
+		return nil, err
+	}
+
+	// Special case the 'properties' output property as required.
+	// This should be gone when we apply flattening.
+	if _, ok := result.specs["properties"]; ok {
+		result.requiredSpecs.Add("properties")
+	}
+
+	result.description = responseSchema.Description
+	return result, nil
 }
 
 func (m *moduleGenerator) genProperties(resolvedSchema *openapi.Schema, isOutput, isType bool) (*propertyBag, error) {
@@ -1094,10 +1236,7 @@ func (m *moduleGenerator) genProperties(resolvedSchema *openapi.Schema, isOutput
 			}
 
 			propSpec := allOfProperties.specs[sdkDiscriminator]
-			discriminatorValue := resolvedSchema.ReferenceContext.ReferenceName
-			if v, ok := resolvedSchema.Extensions.GetString("x-ms-discriminator-value"); ok {
-				discriminatorValue = v
-			}
+			discriminatorValue := getDiscriminatorValue(resolvedSchema)
 			propSpec.Const = discriminatorValue
 			propSpec.Type = "string"
 			propSpec.Ref = ""
@@ -1152,6 +1291,14 @@ func (m *moduleGenerator) getDiscriminator(resolvedSchema *openapi.Schema) (stri
 		}
 	}
 	return "", "", false, nil
+}
+
+// getDiscriminatorValue return the value of the discriminator value extension, or the schema name as the default.
+func getDiscriminatorValue(resolvedSchema *openapi.Schema) string {
+	if v, ok := resolvedSchema.Extensions.GetString(extensionDiscriminatorValue); ok {
+		return v
+	}
+	return resolvedSchema.ReferenceContext.ReferenceName
 }
 
 // isWriteOnly return true for properties which are annotated with mutability extension that contain no 'read' value.
@@ -1399,7 +1546,7 @@ func (m *moduleGenerator) genTypeSpec(propertyName string, schema *spec.Schema, 
 					// TODO: this was needed to unblock nightly generation: generalize this case.
 					v = spec
 				}
-				err := 	compatibleTypes(spec, v, isOutput)
+				err := compatibleTypes(spec, v, isOutput)
 				if err != nil {
 					return nil, errors.Wrapf(err, "incompatible type %q for resource %q", tok, m.resourceName)
 				}
@@ -1646,24 +1793,24 @@ var typeNameOverrides = map[string]string{
 	// In particular, the IP Filter Rule has more properties in the DPS version.
 	"Devices.IotDpsResource.IpFilterRule": "TargetIpFilterRule",
 	// Workbook vs. MyWorkbook types are slightly different. Probably, a bug in the spec, but we have to disambiguate.
-	"Insights.MyWorkbook.ManagedIdentity": "MyManagedIdentity",
+	"Insights.MyWorkbook.ManagedIdentity":        "MyManagedIdentity",
 	"Insights.MyWorkbook.UserAssignedIdentities": "MyUserAssignedIdentities",
 	// Experiment's endpoint is a much narrower type compared to endpoints in other network resources.
 	"Network.Experiment.Endpoint": "ExperimentEndpoint",
 	// These are all FrontDoor types. FrontDoor shares a bunch of type names with generate Network provider,
 	// but defines them in its own way.
 	"Network.Policy.ManagedRuleGroupOverride": "FrontDoorManagedRuleGroupOverride",
-	"Network.Policy.ManagedRuleOverride": "FrontDoorManagedRuleOverride",
-	"Network.Policy.ManagedRuleSet": "FrontDoorManagedRuleSet",
-	"Network.Policy.MatchCondition": "FrontDoorMatchCondition",
-	"Network.Policy.MatchVariable": "FrontDoorMatchVariable",
-	"Network.Policy.PolicySettings": "FrontDoorPolicySettings",
+	"Network.Policy.ManagedRuleOverride":      "FrontDoorManagedRuleOverride",
+	"Network.Policy.ManagedRuleSet":           "FrontDoorManagedRuleSet",
+	"Network.Policy.MatchCondition":           "FrontDoorMatchCondition",
+	"Network.Policy.MatchVariable":            "FrontDoorMatchVariable",
+	"Network.Policy.PolicySettings":           "FrontDoorPolicySettings",
 	// The following two types are read-only, while the same types in another spec are writable.
-	"RecoveryServices.Vault.PrivateEndpointConnection": "VaultPrivateEndpointConnection",
+	"RecoveryServices.Vault.PrivateEndpointConnection":         "VaultPrivateEndpointConnection",
 	"RecoveryServices.Vault.PrivateLinkServiceConnectionState": "VaultPrivateLinkServiceConnectionState",
 	// Watchlist resources only appear in a preview spec and not in stable specs. Anyway, the shapes of their
 	// types are slightly different from later specs, so we have to disambiguate for top-level resources.
-	"SecurityInsights.Watchlist.UserInfo": "WatchlistUserInfo",
+	"SecurityInsights.Watchlist.UserInfo":     "WatchlistUserInfo",
 	"SecurityInsights.WatchlistItem.UserInfo": "WatchlistUserInfo",
 }
 
