@@ -12,6 +12,7 @@ namespace Pulumi.AzureNative.DataBoxEdge.V20200901Preview
     /// <summary>
     /// Role Addon
     /// </summary>
+    [Obsolete(@"Addon is deprecated. Please use one of the variants: ArcAddon, IoTAddon.")]
     [AzureNativeResourceType("azure-native:databoxedge/v20200901preview:Addon")]
     public partial class Addon : Pulumi.CustomResource
     {

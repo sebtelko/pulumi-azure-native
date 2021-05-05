@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.Network
 {
+    [Obsolete(@"UserRule is deprecated. Please use one of the variants: DefaultUserRule, UserRule.")]
     public static class GetUserRule
     {
         /// <summary>

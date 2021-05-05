@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.Blueprint
 {
+    [Obsolete(@"Artifact is deprecated. Please use one of the variants: PolicyAssignmentArtifact, RoleAssignmentArtifact, TemplateArtifact.")]
     public static class GetArtifact
     {
         /// <summary>

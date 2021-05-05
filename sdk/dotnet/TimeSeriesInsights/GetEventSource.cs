@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.TimeSeriesInsights
 {
+    [Obsolete(@"EventSource is deprecated. Please use one of the variants: EventHubEventSource, IoTHubEventSource.")]
     public static class GetEventSource
     {
         /// <summary>

@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.SecurityInsights
 {
+    [Obsolete(@"AlertRule is deprecated. Please use one of the variants: FusionAlertRule, MicrosoftSecurityIncidentCreationAlertRule, ScheduledAlertRule.")]
     public static class GetAlertRule
     {
         /// <summary>

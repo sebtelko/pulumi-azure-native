@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.DataBoxEdge
 {
+    [Obsolete(@"Trigger is deprecated. Please use one of the variants: FileEventTrigger, PeriodicTimerEventTrigger.")]
     public static class GetTrigger
     {
         /// <summary>

@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.Kusto.V20200918
 {
+    [Obsolete(@"DataConnection is deprecated. Please use one of the variants: EventGridDataConnection, EventHubDataConnection, IotHubDataConnection.")]
     public static class GetDataConnection
     {
         /// <summary>

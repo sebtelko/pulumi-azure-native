@@ -9,6 +9,7 @@ using Pulumi.Serialization;
 
 namespace Pulumi.AzureNative.Synapse
 {
+    [Obsolete(@"Database is deprecated. Please use one of the variants: ReadWriteDatabase.")]
     public static class GetDatabase
     {
         /// <summary>
