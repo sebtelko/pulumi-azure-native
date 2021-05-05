@@ -8,7 +8,9 @@ import * as utilities from "../../utilities";
 /**
  * Class representing a data connection.
  */
+/** @deprecated DataConnection is deprecated. Please use one of the variants: EventGridDataConnection, EventHubDataConnection, IotHubDataConnection. */
 export function getDataConnection(args: GetDataConnectionArgs, opts?: pulumi.InvokeOptions): Promise<GetDataConnectionResult> {
+    pulumi.log.warn("getDataConnection is deprecated: DataConnection is deprecated. Please use one of the variants: EventGridDataConnection, EventHubDataConnection, IotHubDataConnection.")
     if (!opts) {
         opts = {}
     }
