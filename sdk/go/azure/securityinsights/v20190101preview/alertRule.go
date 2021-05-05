@@ -12,6 +12,8 @@ import (
 )
 
 // Alert rule.
+//
+// Deprecated: AlertRule is deprecated. Please use one of the variants: FusionAlertRule, MLBehaviorAnalyticsAlertRule, MicrosoftSecurityIncidentCreationAlertRule, ScheduledAlertRule, ThreatIntelligenceAlertRule.
 type AlertRule struct {
 	pulumi.CustomResourceState
 

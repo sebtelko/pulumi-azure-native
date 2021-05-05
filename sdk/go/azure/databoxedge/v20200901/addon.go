@@ -12,6 +12,8 @@ import (
 )
 
 // Role Addon
+//
+// Deprecated: Addon is deprecated. Please use one of the variants: ArcAddon, IoTAddon.
 type Addon struct {
 	pulumi.CustomResourceState
 

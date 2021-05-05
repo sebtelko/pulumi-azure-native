@@ -12,6 +12,8 @@ import (
 )
 
 // Deployment script object.
+//
+// Deprecated: DeploymentScript is deprecated. Please use one of the variants: AzureCliScript, AzurePowerShellScript.
 type DeploymentScript struct {
 	pulumi.CustomResourceState
 

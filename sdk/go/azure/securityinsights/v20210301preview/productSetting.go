@@ -12,6 +12,8 @@ import (
 )
 
 // The Setting.
+//
+// Deprecated: ProductSetting is deprecated. Please use one of the variants: EntityAnalytics, EyesOn, Ueba.
 type ProductSetting struct {
 	pulumi.CustomResourceState
 

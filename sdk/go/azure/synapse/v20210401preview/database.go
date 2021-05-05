@@ -12,6 +12,8 @@ import (
 )
 
 // Class representing a Kusto database.
+//
+// Deprecated: Database is deprecated. Please use one of the variants: ReadWriteDatabase.
 type Database struct {
 	pulumi.CustomResourceState
 

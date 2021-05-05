@@ -13,6 +13,8 @@ import (
 
 // Represents a blueprint artifact.
 // API Version: 2018-11-01-preview.
+//
+// Deprecated: Artifact is deprecated. Please use one of the variants: PolicyAssignmentArtifact, RoleAssignmentArtifact, TemplateArtifact.
 type Artifact struct {
 	pulumi.CustomResourceState
 
